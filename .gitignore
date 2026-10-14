@@ -1,0 +1,11 @@
+
+# Generated files
+*.exe
+baseline.json
+
+# Local test data
+TestFolder/
+
+# Logs
+*.log
+logs/
