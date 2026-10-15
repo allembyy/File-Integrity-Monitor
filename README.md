@@ -1,129 +1,121 @@
 # File Integrity Monitor (FIM)
 
-A lightweight, command-line File Integrity Monitor built with **Go** for Windows. It uses SHA-256 cryptographic hashing to establish a trusted baseline of files and detect unauthorized or unexpected changes.
-
-## Overview
-
-File integrity monitoring helps identify changes to files that may indicate accidental modification, corruption, or potentially malicious activity.
-
-This project recursively scans a target directory, calculates SHA-256 hashes for its files, and stores them in a JSON baseline. Subsequent scans compare the current state against that baseline and report modified, added, and deleted files.
+A Go-based File Integrity Monitor that uses **SHA-256 hashing** to detect file changes against a trusted baseline. It supports startup integrity checks, real-time filesystem monitoring, and audit logging on Windows.
 
 ## Features
 
-- **SHA-256 Hashing:** Generates cryptographic hashes using Go's `crypto/sha256` package.
-- **Recursive Scanning:** Traverses subdirectories to monitor files.
-- **Baseline Creation:** Records file paths and hashes in a JSON file.
-- **Integrity Verification:** Compares current file hashes against the saved baseline.
-- **Change Detection:** Identifies modified, added, and deleted files.
-- **Command-Line Interface:** Supports baseline initialization and integrity scans.
+- **SHA-256 hashing** — creates file fingerprints to verify integrity.
+- **Baseline management** — stores a trusted snapshot for each monitored folder.
+- **Interactive baseline selection** — keep the existing baseline or confirm creation of a new one.
+- **Integrity scanning** — detects added, modified, and deleted files.
+- **Startup integrity checks** — identifies persistent changes made while monitoring was stopped.
+- **Real-time monitoring** — watches filesystem events using `fsnotify`.
+- **Audit logging** — records detected changes in `audit.log`.
+- **Colored terminal interface** — makes different event types easier to distinguish.
+- **Windows folder picker** — launch monitoring through `StartMonitor.bat`.
 
-## Tech Stack
+## How It Works
+
+The monitor calculates a SHA-256 hash for each file and compares it with the corresponding hash in the saved baseline.
+
+| Event | Meaning |
+|---|---|
+| `ADDED` | A file exists but was not recorded in the baseline. |
+| `MODIFIED` | A file's current hash differs from its baseline hash. |
+| `DELETED` | A file recorded in the baseline is no longer present. |
+
+The baseline is not automatically updated when a change is detected. This preserves the original trusted reference until the user explicitly chooses to rebuild it.
+
+When monitoring starts, the program checks for persistent differences from the baseline before continuing with real-time monitoring.
+
+## Technology Stack
 
 - **Language:** Go
-- **Cryptography:** SHA-256
-- **Data Storage:** JSON
+- **Hashing:** SHA-256
+- **Filesystem events:** `github.com/fsnotify/fsnotify`
+- **Baseline storage:** JSON
 - **Platform:** Windows
-- **Version Control:** Git and GitHub
+
+## Project Structure
+
+| File | Purpose |
+|---|---|
+| `main.go` | CLI commands, folder validation, and baseline selection |
+| `hash.go` | SHA-256 hash calculation |
+| `baseline.go` | Baseline creation, loading, saving, and storage |
+| `scanner.go` | Integrity comparison and scan report |
+| `monitor.go` | Startup checks and real-time monitoring |
+| `audit.go` | Audit event recording |
+| `StartMonitor.bat` | Windows folder picker and launcher |
+| `go.mod` / `go.sum` | Go dependencies |
 
 ## Getting Started
 
-### Prerequisites
+### Requirements
 
 - Windows
-- [Go](https://go.dev/dl/) installed and available in your PATH
-- Git (optional, for cloning the repository)
+- Go installed
+- Git, if cloning the repository
 
-### Installation
+### Clone the repository
 
-Clone the repository:
-
-```bash
+```powershell
 git clone https://github.com/allembyy/File-Integrity-Monitor.git
 cd File-Integrity-Monitor
 ```
 
-### Usage
-
-**1. Create a baseline**
-
-Run the following command from the project root:
+### Build
 
 ```powershell
-go run -buildvcs=false . init ".\TestFolder"
+go build -o FileIntegrityMonitor.exe .
 ```
 
-Replace `.\TestFolder` with the directory you want to monitor.
+### Run
 
-This recursively hashes the files in the target directory and saves the baseline to `baseline.json` in the project root.
+Launch `StartMonitor.bat` and select the folder you want to monitor.
 
-**2. Scan for changes**
+You can also use the executable directly:
 
 ```powershell
-go run -buildvcs=false . scan ".\TestFolder"
+.\FileIntegrityMonitor.exe init "C:\path\to\folder"
+.\FileIntegrityMonitor.exe scan "C:\path\to\folder"
+.\FileIntegrityMonitor.exe monitor "C:\path\to\folder"
 ```
 
-The scan compares the current directory contents against the saved baseline.
+The `init` command creates or rebuilds a baseline according to the program's confirmation workflow. The `scan` command performs a one-time comparison, while `monitor` performs startup checks and then watches for real-time changes.
 
-### Example Output
+## Testing
 
-```text
---- Integrity Report ---
-[MODIFIED]  C:\...\TestFolder\test.txt
-[ADDED]     C:\...\TestFolder\newfile.txt
-[DELETED]   C:\...\TestFolder\oldfile.txt
+Use a disposable test folder to verify the following:
 
-Summary: 1 modified, 1 added, 1 deleted
-```
+1. Modify an existing file.
+2. Add a new file.
+3. Delete a file recorded in the baseline.
+4. Stop monitoring, modify a file, and restart while keeping the original baseline.
+5. Test changes inside nested directories.
+6. Verify that events appear in the terminal and are recorded in the audit log.
+7. Test keeping an existing baseline versus explicitly rebuilding it.
 
-The output above is an example; actual results depend on the files in the monitored directory.
+## Limitations
 
-## How It Works
+- Changes made while the monitor is stopped can be detected if their effects still exist when monitoring restarts. The program cannot reconstruct every action that occurred while it was offline.
+- Multiple offline edits may appear as one final `MODIFIED` finding.
+- The audit log and baseline are not inherently tamper-proof against an attacker with sufficient system permissions.
+- Files that cannot be accessed or hashed may not be fully inspected.
 
-1. **Initialization:** Recursively scans the target directory and calculates a SHA-256 hash for each file.
-2. **Baseline Storage:** Saves file paths and their hashes in `baseline.json`.
-3. **Integrity Scan:** Recalculates hashes and compares them with the baseline.
-4. **Change Reporting:** Reports files as modified, added, or deleted.
+## Future Improvements
 
-The baseline is not automatically updated during a scan, allowing changes to remain detectable until you intentionally create a new baseline.
+Potential next steps include:
 
-## Project Structure
+- Automated Go tests and continuous integration.
+- Stronger baseline and audit-log tamper detection.
+- Improved rename and directory-deletion handling.
+- Configurable exclusions and ignored paths.
+- JSON or CSV report export.
+- Optional notifications and a graphical dashboard.
 
-```text
-File-Integrity-Monitor/
-├── main.go
-├── go.mod
-├── .gitignore
-└── baseline.json    # Generated locally; not committed
-```
+## Project Goal
 
-## Current Limitations
+This project explores file integrity verification, baseline-based change detection, filesystem event monitoring, and audit logging as practical applications of cybersecurity and operating-systems concepts.
 
-- Currently supports manual scans through the command line.
-- File monitoring depends on the integrity of the saved baseline.
-- Does not yet provide real-time monitoring or automated alerts.
-- Intended as an educational project, not a replacement for enterprise security software.
-
-## Planned Improvements
-
-- Real-time Windows filesystem monitoring using `ReadDirectoryChangesW`.
-- Improved event handling and change reporting.
-- Logging and configurable monitoring options.
-- Stronger baseline protection and integrity verification.
-- Unit tests and improved error handling.
-
-## Learning Objectives
-
-This project explores practical applications of:
-
-- Operating system file handling and directory traversal.
-- Cryptographic hashing and file integrity verification.
-- Command-line application development in Go.
-- Filesystem monitoring and security concepts.
-
-## Disclaimer
-
-This project is developed for educational purposes to explore file integrity monitoring and operating system security concepts.
-
-## License
-
-No license has been added yet. Add a license if you intend to permit others to use, modify, or distribute this project.
+**Repository:** https://github.com/allembyy/File-Integrity-Monitor
