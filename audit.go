@@ -8,8 +8,9 @@ import (
 )
 
 type Change struct {
-	Event string
-	Path  string
+	Event   string
+	Path    string
+	OldPath string
 }
 
 func appendAuditLog(logPath, folder string, changes []Change) error {
@@ -30,7 +31,15 @@ func appendAuditLog(logPath, folder string, changes []Change) error {
 	for _, change := range changes {
 		relativePath, err := filepath.Rel(folder, change.Path)
 		if err != nil {
-			return fmt.Errorf("cannot resolve logged path: %w", err)
+			relativePath = change.Path
+		}
+
+		if change.OldPath != "" {
+			oldRel, err := filepath.Rel(folder, change.OldPath)
+			if err != nil {
+				oldRel = change.OldPath
+			}
+			relativePath = fmt.Sprintf("%s -> %s", oldRel, relativePath)
 		}
 
 		timestamp := time.Now().Format(time.RFC3339)

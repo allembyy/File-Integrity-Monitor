@@ -61,6 +61,9 @@ func printEvent(event, path string) {
 	case "DELETED":
 		color = colorRed
 		symbol = "!"
+	case "RENAMED":
+		color = colorCyan
+		symbol = "»"
 	}
 
 	fmt.Printf("%s%s  [%s] %-8s %s%s\n",
@@ -140,6 +143,136 @@ func compareWithBaseline(
 	return changes, nil
 }
 
+// PendingRename tracks a Rename event waiting for a paired Create event.
+type PendingRename struct {
+	OldPath   string
+	Timestamp time.Time
+}
+
+// RenamePairer pairs Windows fsnotify Rename and Create events within a time window.
+type RenamePairer struct {
+	known   Baseline
+	window  time.Duration
+	clock   Clock
+	pending []PendingRename
+}
+
+func NewRenamePairer(known Baseline, window time.Duration, clock Clock) *RenamePairer {
+	if clock == nil {
+		clock = realClock{}
+	}
+	if window <= 0 {
+		window = 500 * time.Millisecond
+	}
+	return &RenamePairer{
+		known:  known,
+		window: window,
+		clock:  clock,
+	}
+}
+
+func (p *RenamePairer) HasPending() bool {
+	return len(p.pending) > 0
+}
+
+func (p *RenamePairer) NextTimeout(now time.Time) time.Duration {
+	if len(p.pending) == 0 {
+		return 0
+	}
+	earliest := p.pending[0].Timestamp
+	elapsed := now.Sub(earliest)
+	if elapsed >= p.window {
+		return 0
+	}
+	return p.window - elapsed
+}
+
+func (p *RenamePairer) FlushExpired(now time.Time) []Change {
+	cutoff := now.Add(-p.window)
+	var active []PendingRename
+	var emitted []Change
+
+	for _, item := range p.pending {
+		if !item.Timestamp.After(cutoff) {
+			if _, exists := p.known[item.OldPath]; exists {
+				emitted = append(emitted, Change{
+					Event: "DELETED",
+					Path:  item.OldPath,
+				})
+			}
+		} else {
+			active = append(active, item)
+		}
+	}
+
+	p.pending = active
+	return emitted
+}
+
+func (p *RenamePairer) HandleEvent(op fsnotify.Op, path string, now time.Time) []Change {
+	emitted := p.FlushExpired(now)
+
+	if op&fsnotify.Rename != 0 {
+		p.pending = append(p.pending, PendingRename{
+			OldPath:   path,
+			Timestamp: now,
+		})
+		return emitted
+	}
+
+	if op&fsnotify.Create != 0 {
+		if len(p.pending) > 0 {
+			idx := -1
+			dir := filepath.Dir(path)
+			for i := len(p.pending) - 1; i >= 0; i-- {
+				if filepath.Dir(p.pending[i].OldPath) == dir {
+					idx = i
+					break
+				}
+			}
+			if idx == -1 {
+				idx = len(p.pending) - 1
+			}
+
+			matched := p.pending[idx]
+			p.pending = append(p.pending[:idx], p.pending[idx+1:]...)
+
+			emitted = append(emitted, Change{
+				Event:   "RENAMED",
+				OldPath: matched.OldPath,
+				Path:    path,
+			})
+			return emitted
+		}
+
+		emitted = append(emitted, Change{
+			Event: "ADDED",
+			Path:  path,
+		})
+		return emitted
+	}
+
+	if op&fsnotify.Remove != 0 {
+		if _, exists := p.known[path]; exists {
+			emitted = append(emitted, Change{
+				Event: "DELETED",
+				Path:  path,
+			})
+		}
+		return emitted
+	}
+
+	if op&fsnotify.Write != 0 {
+		emitted = append(emitted, Change{
+			Event: "MODIFIED",
+			Path:  path,
+		})
+		return emitted
+	}
+
+	return emitted
+}
+
 // monitorFolder checks for changes missed while stopped, then
 // watches for new filesystem events in real time.
 func monitorFolder(folder, baselinePath, logPath string) error {
@@ -159,6 +292,15 @@ func monitorFolder(folder, baselinePath, logPath string) error {
 	if err := addDirectories(watcher, folder); err != nil {
 		return fmt.Errorf("cannot watch folder: %w", err)
 	}
+
+	detector := NewDetector(DetectorConfig{
+		Window:         DefaultWindowSeconds * time.Second,
+		EventThreshold: DefaultEventThreshold,
+		ScoreThreshold: DefaultScoreThreshold,
+		Cooldown:       DefaultCooldown,
+		LogPath:        logPath,
+		Folder:         folder,
+	})
 
 	// Compare current files with the original baseline.
 	startupChanges, err := compareWithBaseline(folder, known)
@@ -207,9 +349,219 @@ func monitorFolder(folder, baselinePath, logPath string) error {
 
 	// Track events already reported during this monitoring session.
 	reported := make(map[string]string)
+	pairer := NewRenamePairer(known, 500*time.Millisecond, realClock{})
+
+	var renameTimer *time.Timer
+	var renameTimerCh <-chan time.Time
+
+	resetTimer := func() {
+		if pairer.HasPending() {
+			d := pairer.NextTimeout(time.Now())
+			if renameTimer == nil {
+				renameTimer = time.NewTimer(d)
+			} else {
+				if !renameTimer.Stop() {
+					select {
+					case <-renameTimer.C:
+					default:
+					}
+				}
+				renameTimer.Reset(d)
+			}
+			renameTimerCh = renameTimer.C
+		} else {
+			if renameTimer != nil {
+				renameTimer.Stop()
+			}
+			renameTimerCh = nil
+		}
+	}
+
+	handleResolvedChange := func(change Change) {
+		switch change.Event {
+		case "RENAMED":
+			time.Sleep(100 * time.Millisecond)
+
+			oldBaselineHash, tracked := known[change.OldPath]
+			var contentStatus string
+			if tracked {
+				newHash, hashErr := calculateHash(change.Path)
+				if hashErr == nil {
+					if newHash == oldBaselineHash {
+						contentStatus = "content unchanged"
+					} else {
+						contentStatus = "content modified"
+					}
+				}
+			}
+
+			signature := fmt.Sprintf("RENAMED:%s->%s", change.OldPath, change.Path)
+			if reported[change.Path] == signature {
+				return
+			}
+			reported[change.Path] = signature
+
+			if err := appendAuditLog(logPath, folder, []Change{change}); err != nil {
+				fmt.Println(colorRed + "Audit log error: " + err.Error() + colorReset)
+				return
+			}
+
+			oldRel, err := filepath.Rel(folder, change.OldPath)
+			if err != nil {
+				oldRel = change.OldPath
+			}
+			newRel, err := filepath.Rel(folder, change.Path)
+			if err != nil {
+				newRel = change.Path
+			}
+
+			printEvent("RENAMED", fmt.Sprintf("%s -> %s", oldRel, newRel))
+			if contentStatus != "" {
+				statusColor := colorCyan
+				if contentStatus == "content modified" {
+					statusColor = colorYellow
+				}
+				fmt.Printf("%s          (%s)%s\n", statusColor, contentStatus, colorReset)
+			}
+			fmt.Println(colorGreen + "          Audit log updated" + colorReset)
+			fmt.Println()
+
+			var entropy float64
+			if ent, entErr := ComputeFileEntropy(change.Path, MaxEntropyBytes); entErr == nil {
+				entropy = ent
+			}
+			detector.RecordEventWithTime("RENAMED", change.Path, time.Now(), entropy)
+
+		case "DELETED":
+			if _, exists := known[change.Path]; !exists {
+				return
+			}
+
+			signature := "DELETED"
+			if reported[change.Path] == signature {
+				return
+			}
+			reported[change.Path] = signature
+
+			if err := appendAuditLog(logPath, folder, []Change{change}); err != nil {
+				fmt.Println(colorRed + "Audit log error: " + err.Error() + colorReset)
+				return
+			}
+
+			rel, err := filepath.Rel(folder, change.Path)
+			if err != nil {
+				rel = change.Path
+			}
+
+			printEvent("DELETED", rel)
+			fmt.Println(colorGreen + "          Audit log updated" + colorReset)
+			fmt.Println()
+
+			detector.RecordEventWithTime("DELETED", change.Path, time.Now(), 0)
+
+		case "ADDED":
+			time.Sleep(100 * time.Millisecond)
+			info, statErr := os.Stat(change.Path)
+			if statErr != nil || info.IsDir() {
+				return
+			}
+
+			hash, hashErr := calculateHash(change.Path)
+			if hashErr != nil {
+				return
+			}
+
+			oldHash, exists := known[change.Path]
+			if exists && oldHash == hash {
+				delete(reported, change.Path)
+				return
+			}
+
+			signature := "ADDED:" + hash
+			if reported[change.Path] == signature {
+				return
+			}
+			reported[change.Path] = signature
+
+			if err := appendAuditLog(logPath, folder, []Change{change}); err != nil {
+				fmt.Println(colorRed + "Audit log error: " + err.Error() + colorReset)
+				return
+			}
+
+			rel, err := filepath.Rel(folder, change.Path)
+			if err != nil {
+				rel = change.Path
+			}
+
+			printEvent("ADDED", rel)
+			fmt.Println(colorGreen + "          Audit log updated" + colorReset)
+			fmt.Println()
+
+			var entropy float64
+			if ent, entErr := ComputeFileEntropy(change.Path, MaxEntropyBytes); entErr == nil {
+				entropy = ent
+			}
+			detector.RecordEventWithTime("ADDED", change.Path, time.Now(), entropy)
+
+		case "MODIFIED":
+			time.Sleep(100 * time.Millisecond)
+			info, statErr := os.Stat(change.Path)
+			if statErr != nil || info.IsDir() {
+				return
+			}
+
+			hash, hashErr := calculateHash(change.Path)
+			if hashErr != nil {
+				return
+			}
+
+			oldHash, exists := known[change.Path]
+			eventType := "MODIFIED"
+			if !exists {
+				eventType = "ADDED"
+			} else if oldHash == hash {
+				delete(reported, change.Path)
+				return
+			}
+
+			signature := eventType + ":" + hash
+			if reported[change.Path] == signature {
+				return
+			}
+			reported[change.Path] = signature
+
+			change.Event = eventType
+			if err := appendAuditLog(logPath, folder, []Change{change}); err != nil {
+				fmt.Println(colorRed + "Audit log error: " + err.Error() + colorReset)
+				return
+			}
+
+			rel, err := filepath.Rel(folder, change.Path)
+			if err != nil {
+				rel = change.Path
+			}
+
+			printEvent(eventType, rel)
+			fmt.Println(colorGreen + "          Audit log updated" + colorReset)
+			fmt.Println()
+
+			var entropy float64
+			if ent, entErr := ComputeFileEntropy(change.Path, MaxEntropyBytes); entErr == nil {
+				entropy = ent
+			}
+			detector.RecordEventWithTime(eventType, change.Path, time.Now(), entropy)
+		}
+	}
 
 	for {
 		select {
+		case <-renameTimerCh:
+			emitted := pairer.FlushExpired(time.Now())
+			resetTimer()
+			for _, ch := range emitted {
+				handleResolvedChange(ch)
+			}
+
 		case event, ok := <-watcher.Events:
 			if !ok {
 				return nil
@@ -246,92 +598,11 @@ func monitorFolder(folder, baselinePath, logPath string) error {
 				continue
 			}
 
-			// Give file writes a short time to settle.
-			time.Sleep(200 * time.Millisecond)
-
-			info, statErr := os.Stat(path)
-
-			var change Change
-			var signature string
-
-			if statErr != nil {
-				if !os.IsNotExist(statErr) {
-					fmt.Println(colorRed +
-						"Cannot inspect file: " + path + ": " +
-						statErr.Error() + colorReset)
-					continue
-				}
-
-				if _, exists := known[path]; !exists {
-					continue
-				}
-
-				change = Change{
-					Event: "DELETED",
-					Path:  path,
-				}
-				signature = "DELETED"
-			} else {
-				if info.IsDir() {
-					continue
-				}
-
-				hash, hashErr := calculateHash(path)
-				if hashErr != nil {
-					fmt.Println(colorYellow +
-						"File is temporarily unavailable: " + path +
-						colorReset)
-					continue
-				}
-
-				oldHash, exists := known[path]
-
-				if !exists {
-					change = Change{
-						Event: "ADDED",
-						Path:  path,
-					}
-					signature = "ADDED"
-				} else if oldHash != hash {
-					change = Change{
-						Event: "MODIFIED",
-						Path:  path,
-					}
-					signature = "MODIFIED:" + hash
-				} else {
-					// File matches the original baseline again.
-					delete(reported, path)
-					continue
-				}
+			emitted := pairer.HandleEvent(event.Op, path, time.Now())
+			resetTimer()
+			for _, ch := range emitted {
+				handleResolvedChange(ch)
 			}
-
-			if reported[path] == signature {
-				continue
-			}
-
-			if err := appendAuditLog(
-				logPath,
-				folder,
-				[]Change{change},
-			); err != nil {
-				fmt.Println(colorRed +
-					"Audit log error: " + err.Error() +
-					colorReset)
-				continue
-			}
-
-			reported[path] = signature
-
-			relativePath, err := filepath.Rel(folder, path)
-			if err != nil {
-				relativePath = path
-			}
-
-			printEvent(change.Event, relativePath)
-			fmt.Println(colorGreen +
-				"          Audit log updated" +
-				colorReset)
-			fmt.Println()
 
 		case err, ok := <-watcher.Errors:
 			if !ok {
